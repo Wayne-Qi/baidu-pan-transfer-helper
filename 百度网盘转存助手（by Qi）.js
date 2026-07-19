@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         百度网盘转存助手（by Qi）
 // @namespace    https://github.com/Wayne-Qi
-// @version      1.1
+// @version      1.1.1
 // @author       Qi
 // @description  基于稳定内核，优化文件夹转存策略（预分块），支持自动建文件夹、记忆设置、完成提示音
 // @supportURL   tencent://message/?uin=544439919
@@ -174,6 +174,9 @@
                 if (this.onLog) this.onLog(`✅ 成功转存 ${fsidList.length} 个文件/文件夹`);
                 return response;
             } catch (error) {
+                if (isNoRetryError(error)) {
+                    throw error;
+                }
                 if (retryCount < this.maxRetries && (error.message.includes('timeout') || error.message.includes('Network'))) {
                     if (this.onLog) this.onLog(`⏳ 网络超时，重试 (${retryCount+1}/${this.maxRetries})`);
                     await new Promise(resolve => setTimeout(resolve, 3000));
@@ -277,6 +280,9 @@
                 }
                 if (this.onLog) this.onLog(`✅ 文件转存完成 (${fileList.length} 个)`);
             } catch (error) {
+                if (isNoRetryError(error)) {
+                    throw error;
+                }
                 if (retryCount < this.maxRetries && !this.cancel) {
                     if (this.onLog) this.onLog(`⏳ 文件转存失败，重试 (${retryCount+1}/${this.maxRetries})`);
                     await new Promise(resolve => setTimeout(resolve, 5000));
@@ -336,6 +342,9 @@
                             }
                         }
                     } else {
+                        if (isNoRetryError(error)) {
+                            throw error;
+                        }
                         if (retryCount < this.maxRetries && !this.cancel) {
                             if (this.onLog) this.onLog(`⏳ 文件夹转存失败，重试 (${retryCount+1}/${this.maxRetries})`);
                             await new Promise(resolve => setTimeout(resolve, 10000));
@@ -473,6 +482,53 @@
         return `/转存_${dateStr}`;
     }
 
+    function isAutoDatePath(path) {
+        return /^\/转存_\d{4}-\d{2}-\d{2}$/.test(path || '');
+    }
+
+    function normalizeTargetPath(path) {
+        path = (path || '').trim();
+        if (!path) return '';
+        if (!path.startsWith('/')) {
+            path = '/' + path;
+        }
+        return path.replace(/\/+/g, '/');
+    }
+
+    function isNoRetryError(error) {
+        const msg = error && error.message ? error.message : String(error || '');
+        return msg.includes('剩余空间不足') ||
+               msg.includes('空间不足') ||
+               msg.includes('容量不足') ||
+               msg.toLowerCase().includes('insufficient storage');
+    }
+
+    function friendlyErrorMessage(error) {
+        const msg = error && error.message ? error.message : String(error || '');
+        if (msg.includes('剩余空间不足') || msg.includes('空间不足') || msg.includes('容量不足') || msg.toLowerCase().includes('insufficient storage')) {
+            return '目标网盘剩余空间不足，请清理空间或更换账号后重试';
+        }
+        if (msg.includes('TransferLimitExceededException')) {
+            return '单批文件夹内容超限，脚本已尝试自动拆分；如果仍失败，请换更小的目录重试';
+        }
+        if (msg.includes('timeout') || msg.includes('Network')) {
+            return '网络超时或百度接口响应慢，请稍后重试';
+        }
+        if (msg.includes('rate limit') || msg.includes('限流')) {
+            return '百度接口限流，请等待一段时间后再试';
+        }
+        if (msg.includes('Wrong password')) {
+            return '提取码错误，请检查后重试';
+        }
+        if (msg.includes('Password not specified')) {
+            return '该分享需要提取码，请填写后重试';
+        }
+        if (msg.includes('Unable to extract share key')) {
+            return '无法识别分享链接，请检查链接是否完整';
+        }
+        return msg || '未知错误';
+    }
+
     function addLog(message, type = 'info') {
         const time = new Date().toLocaleTimeString();
         appState.logMessages.unshift({ time, message, type });
@@ -552,6 +608,12 @@
             document.getElementById('input-path').value = targetPath;
             addLog(`📁 未指定路径，自动创建：${targetPath}`, 'info');
         }
+        const normalizedPath = normalizeTargetPath(targetPath);
+        if (normalizedPath !== targetPath) {
+            targetPath = normalizedPath;
+            document.getElementById('input-path').value = targetPath;
+            addLog(`📁 目标路径已自动修正为：${targetPath}`, 'info');
+        }
 
         saveMemory(pwd, targetPath);
 
@@ -612,8 +674,9 @@
                 addLog('⏹ 已安全停止', 'warning');
             } else {
                 appState.status = STATE.ERROR;
-                appState.errorMessage = error.message || '未知错误';
-                addLog(`❌ 转存失败：${error.message}`, 'error');
+                const message = friendlyErrorMessage(error);
+                appState.errorMessage = message;
+                addLog(`❌ 转存失败：${message}`, 'error');
                 playBeep();
             }
             updateUI();
@@ -673,7 +736,13 @@
                 </div>
 
                 <div class="log-section">
-                    <div class="log-header"><span>运行日志</span><button class="btn-clear" id="btn-clear-log">清空</button></div>
+                    <div class="log-header">
+                        <span>运行日志</span>
+                        <div class="log-actions">
+                            <button class="btn-copy-log" id="btn-copy-log">复制日志</button>
+                            <button class="btn-clear" id="btn-clear-log">清空</button>
+                        </div>
+                    </div>
                     <div class="log-content" id="log-content"></div>
                 </div>
             </div>
@@ -696,10 +765,13 @@
         if (memory.pwd && !pwdInput.value) {
             pwdInput.value = memory.pwd;
         }
-        if (memory.path) {
+        if (memory.path && !isAutoDatePath(memory.path)) {
             pathInput.value = memory.path;
         } else {
             pathInput.placeholder = `留空自动建: ${getDefaultPath()}`;
+            if (isAutoDatePath(memory.path)) {
+                pathInput.value = getDefaultPath();
+            }
         }
 
         setupPanelEvents(panel);
@@ -711,6 +783,7 @@
         const startBtn = document.getElementById('btn-start');
         const stopBtn = document.getElementById('btn-stop');
         const clearBtn = document.getElementById('btn-clear-log');
+        const copyBtn = document.getElementById('btn-copy-log');
         const toggleBtn = panel.querySelector('.panel-toggle');
 
         toggleBtn.addEventListener('click', () => {
@@ -736,6 +809,31 @@
         clearBtn.addEventListener('click', () => {
             appState.logMessages = [];
             updateUI();
+        });
+
+        copyBtn.addEventListener('click', async () => {
+            const text = appState.logMessages
+                .slice()
+                .reverse()
+                .map(log => `[${log.time}] ${log.message}`)
+                .join('\n');
+            try {
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    await navigator.clipboard.writeText(text);
+                } else {
+                    const textarea = document.createElement('textarea');
+                    textarea.value = text;
+                    textarea.style.position = 'fixed';
+                    textarea.style.opacity = '0';
+                    document.body.appendChild(textarea);
+                    textarea.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(textarea);
+                }
+                addLog('📋 日志已复制，可直接粘贴反馈', 'success');
+            } catch (e) {
+                addLog('⚠️ 日志复制失败，请手动选择日志内容复制', 'warning');
+            }
         });
     }
 
@@ -900,10 +998,17 @@
                 display: flex; justify-content: space-between; align-items: center;
                 margin-bottom: 6px; font-size: 13px; color: #666;
             }
-            #transfer-helper-panel .btn-clear {
+            #transfer-helper-panel .log-actions {
+                display: flex;
+                gap: 10px;
+                align-items: center;
+            }
+            #transfer-helper-panel .btn-clear,
+            #transfer-helper-panel .btn-copy-log {
                 background: none; border: none; color: #bbb; cursor: pointer; font-size: 13px; padding: 0;
             }
-            #transfer-helper-panel .btn-clear:hover { color: #666; }
+            #transfer-helper-panel .btn-clear:hover,
+            #transfer-helper-panel .btn-copy-log:hover { color: #666; }
             #transfer-helper-panel .log-content {
                 height: 220px;
                 overflow-y: auto;
